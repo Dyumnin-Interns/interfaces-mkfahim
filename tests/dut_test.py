@@ -1,148 +1,199 @@
+import os
+from random import randint
 import cocotb
-from cocotb.triggers import Timer, RisingEdge, FallingEdge, ReadOnly, NextTimeStep
+from cocotb.triggers import FallingEdge, NextTimeStep, Timer, RisingEdge, ReadOnly
 from cocotb_bus.drivers import BusDriver
 from cocotb_bus.monitors import BusMonitor
 from cocotb_coverage.coverage import CoverCross, CoverPoint, coverage_db
-import os
 
-# Scoreboard function
-def sb_fn(actual_value):
-    global expected_value
-    actual = actual_value.integer
-    expected = expected_value.pop(0)
-    assert actual == expected, f"TEST FAILED, expected={expected}, actual={actual}"
 
-# Coverage functions
-@CoverPoint("top.a", xf=lambda x, y: x, bins=[0, 1])
-@CoverPoint("top.b", xf=lambda x, y: y, bins=[0, 1])
-@CoverCross("top.cross.ab", items=["top.a", "top.b"])
-def ab_cover(a, b):
+# Data Containers
+
+
+class WriteTransaction:
+    def __init__(self, address: int, data: int, enable: int = 1):
+        self.address = address
+        self.data = data
+        self.enable = enable
+
+
+class ReadTransaction:
+    def __init__(self, address: int, enable: int = 1):
+        self.address = address
+        self.enable = enable
+
+
+# Scoreboard
+
+class Scoreboard:
+    def __init__(self):
+        self.expected = []
+
+    def push(self, value):
+        self.expected.append(value)
+
+    def check(self, actual_value):
+        expected = self.expected.pop()
+        print(f"Expected: {expected}, Actual: {actual_value}")
+        assert actual_value == expected, "Scoreboard check failed!"
+
+
+# Coverage
+
+
+@CoverPoint("top.write_address", xf=lambda x, y: x, bins=[4, 5])
+@CoverPoint("top.write_data", xf=lambda x, y: y, bins=[0, 1])
+@CoverCross("top.cross.write_comb", items=["top.write_address", "top.write_data"])
+def cover_write_combination(address, data):
     pass
 
-@CoverPoint("top.prot.a.current", xf=lambda x: x['current'], bins=['Idle', 'RDY', 'Txn'])
-@CoverPoint("top.prot.a.previous", xf=lambda x: x['previous'], bins=['Idle', 'RDY', 'Txn'])
-@CoverCross("top.cross.a_prot.cross", items=["top.prot.a.current", "top.prot.a.previous"])
-def a_prot_cover(txn):
+
+@CoverPoint("top.read_address", xf=lambda x: x, bins=[0, 1, 2, 3])
+def cover_read_address(address):
     pass
 
-@cocotb.test()
-async def dut_test(dut):
-    global expected_value
 
-    # Input sequences and expected output
-    a = (0, 0, 1, 1)
-    b = (0, 1, 0, 1)
-    expected_value = [0, 1, 1, 1]
+@CoverPoint("top.port.w.current", xf=lambda x: x['current'],
+            bins=['Write_Idle', 'Write_RDY', 'Write_Txn'])
+@CoverPoint("top.port.w.previous", xf=lambda x: x['previous'],
+            bins=['Write_Idle', 'Write_RDY', 'Write_Txn'])
+@CoverCross("top.cross.write_port", items=["top.port.w.previous", "top.port.w.current"])
+def cover_write_port(txn):
+    print("Write port transition:", txn)
 
-    # Apply reset
-    dut.RST_N.value = 1
-    await Timer(6, 'ns')
-    dut.RST_N.value = 0
-    await Timer(1, 'ns')
-    await RisingEdge(dut.CLK)
-    dut.RST_N.value = 1
-    await Timer(1, 'ns')
 
-    # Instantiate drivers and monitor once
-    adrv = WriteDriver(dut, 'write', dut.CLK, address=4)
-    bdrv = WriteDriver(dut, 'write', dut.CLK, address=5)
-    rdrv = ReadDriver(dut, 'read', dut.CLK, sb_callback=sb_fn)
-    IO_Monitor(dut, 'write', dut.CLK, callback=a_prot_cover)
+@CoverPoint("top.port.r.current", xf=lambda x: x['current'],
+            bins=['Read_Idle', 'Read_RDY', 'Read_Txn'])
+@CoverPoint("top.port.r.previous", xf=lambda x: x['previous'],
+            bins=['Read_Idle', 'Read_RDY', 'Read_Txn'])
+@CoverCross("top.cross.read_port", items=["top.port.r.previous", "top.port.r.current"])
+def cover_read_port(txn):
+    print("Read port transition:", txn)
 
-    for i in range(4):
-        # Write a[i] to address 4
-        await adrv._driver_send(a[i])
-        await Timer(6, 'ns')
 
-        # Trigger read at address 0
-        dut.read_address.value = 0
-        if dut.read_data.value != 1:
-            await RisingEdge(dut.read_data)
-        await Timer(6, 'ns')
+# Drivers and Monitors
 
-        # Write b[i] to address 5
-        await bdrv._driver_send(b[i])
-        await Timer(6, 'ns')
+class WriteDriverAgent(BusDriver):
+    _signals = ["write_rdy", "write_en", "write_data", "write_address"]
 
-        # Collect coverage
-        ab_cover(a[i], b[i])
-
-        # Trigger read at address 1
-        dut.read_address.value = 1
-        if dut.read_data.value != 1:
-            await RisingEdge(dut.read_data)
-        await Timer(6, 'ns')
-
-        # Perform read and check with scoreboard
-        await rdrv._driver_send(None)
-        await Timer(6, 'ns')
-
-    # Report and export coverage
-    coverage_db.report_coverage(cocotb.log.info, bins=True)
-    coverage_file = os.path.join(os.getenv('RESULT_PATH', "./"), 'coverage.xml')
-    coverage_db.export_to_xml(filename=coverage_file)
-
-# Bus drivers
-class WriteDriver(BusDriver):
-    _signals = ['address', 'rdy', 'en', 'data']
-
-    def __init__(self, dut, name, clk, address):
+    def __init__(self, dut, name, clk):
         super().__init__(dut, name, clk)
-        self.bus.en.value = 0
         self.clk = clk
-        self.bus.address.value = address
+        self.bus.write_en.value = 0
 
-    async def _driver_send(self, value, sync=True):
-        if self.bus.rdy.value != 1:
-            await RisingEdge(self.bus.rdy)
-        self.bus.en.value = 1
-        self.bus.data.value = value
+    async def _driver_send(self, txn, sync=True):
+        if self.bus.write_rdy.value != 1:
+            await RisingEdge(self.bus.write_rdy)
+        self.bus.write_en.value = 1
+        self.bus.write_address.value = txn.address
+        self.bus.write_data.value = txn.data
         await ReadOnly()
         await RisingEdge(self.clk)
         await NextTimeStep()
-        self.bus.en.value = 0
-        await NextTimeStep()
+        self.bus.write_en.value = 0
 
-class ReadDriver(BusDriver):
-    _signals = ['address', 'rdy', 'en', 'data']
 
-    def __init__(self, dut, name, clk, sb_callback):
+class ReadDriverAgent(BusDriver):
+    _signals = ["read_rdy", "read_en", "read_data", "read_address"]
+
+    def __init__(self, dut, name, clk):
         super().__init__(dut, name, clk)
-        self.bus.en.value = 0
+        self.bus.read_en.value = 0
         self.clk = clk
-        self.callback = sb_callback
 
-    async def _driver_send(self, value, sync=True):
-        if self.bus.rdy.value != 1:
-            await RisingEdge(self.bus.rdy)
-        self.bus.address.value = 2
-        if self.bus.data.value != 1:
-            await RisingEdge(self.bus.data)
-        await Timer(6, 'ns')
-        self.bus.en.value = 1
-        self.bus.address.value = 3
+    async def _driver_send(self, txn, sync=True):
+        if self.bus.read_rdy.value != 1:
+            await RisingEdge(self.bus.read_rdy)
+        self.bus.read_en.value = 1
+        self.bus.read_address.value = txn.address
         await ReadOnly()
-        self.callback(self.bus.data.value)
         await RisingEdge(self.clk)
         await NextTimeStep()
-        self.bus.en.value = 0
+        self.bus.read_en.value = 0
 
-# Bus monitor
-class IO_Monitor(BusMonitor):
-    _signals = ['address', 'rdy', 'en', 'data']
+
+class OutputMonitorAgent(BusDriver):
+    _signals = ["read_rdy", "read_en", "read_data", "read_address"]
+
+    def __init__(self, dut, name, clk, callback):
+        super().__init__(dut, name, clk)
+        self.clk = clk
+        self.callback = callback
+        self.bus.read_en.value = 0
+
+    async def _driver_send(self, value, sync=True):
+        while True:
+            if self.bus.read_rdy.value != 1:
+                await RisingEdge(self.bus.read_rdy)
+            await ReadOnly()
+            self.callback(int(self.bus.read_data.value))
+            await RisingEdge(self.clk)
+            await NextTimeStep()
+
+
+class ReadMonitor(BusMonitor):
+    _signals = ["read_rdy", "read_en", "read_address", "read_data"]
 
     async def _monitor_recv(self):
-        fallingedge = FallingEdge(self.clock)
-        rdonly = ReadOnly()
-        phases = {
-            0: 'Idle',
-            1: 'RDY',
-            3: 'Txn'
-        }
-        prev = 'Idle'
+        phase_map = {0: 'Read_Idle', 1: 'Read_RDY', 3: 'Read_Txn'}
+        prev = phase_map[0]
         while True:
-            await fallingedge
-            await rdonly
-            txn = (int(self.bus.en.value) << 1) | int(self.bus.rdy.value)
-            self._recv({'previous': prev, 'current': phases[txn]})
-            prev = phases[txn]
+            await FallingEdge(self.clock)
+            await ReadOnly()
+            txn_code = (self.bus.read_en.value << 1) | self.bus.read_rdy.value
+            self._recv({'previous': prev, 'current': phase_map[txn_code]})
+            prev = phase_map[txn_code]
+
+
+class WriteMonitor(BusMonitor):
+    _signals = ["write_rdy", "write_en", "write_address", "write_data"]
+
+    async def _monitor_recv(self):
+        phase_map = {0: 'Write_Idle', 1: 'Write_RDY', 3: 'Write_Txn'}
+        prev = phase_map[0]
+        while True:
+            await FallingEdge(self.clock)
+            await ReadOnly()
+            txn_code = (self.bus.write_en.value << 1) | self.bus.write_rdy.value
+            self._recv({'previous': prev, 'current': phase_map[txn_code]})
+            prev = phase_map[txn_code]
+
+
+# Main Test Function
+
+@cocotb.test()
+async def main_testbench(dut):
+    sb = Scoreboard()
+    write_agent = WriteDriverAgent(dut, "", dut.CLK)
+    read_agent = ReadDriverAgent(dut, "", dut.CLK)
+    OutputMonitorAgent(dut, "", dut.CLK, sb.check)
+    WriteMonitor(dut, '', dut.CLK, callback=cover_write_port)
+    ReadMonitor(dut, '', dut.CLK, callback=cover_read_port)
+
+    # Reset
+    dut.RST_N.value = 1
+    await Timer(20, units="ns")
+    dut.RST_N.value = 0
+    await Timer(20, units="ns")
+    await RisingEdge(dut.CLK)
+    dut.RST_N.value = 1
+
+    for _ in range(200):
+        w_data = randint(0, 1)
+        w_addr = randint(4, 5)
+        r_addr = randint(0, 3)
+
+        write_txn = WriteTransaction(w_addr, w_data)
+        read_txn = ReadTransaction(r_addr)
+
+        write_agent.append(write_txn)
+        read_agent.append(read_txn)
+        sb.push(w_data)
+
+        cover_write_combination(w_addr, w_data)
+        cover_read_address(r_addr)
+
+    await Timer(1000, units="ns")
+    coverage_db.report_coverage(cocotb.log.info, bins=True)
+    output_path = os.getenv("RESULT_PATH", "./")
+    coverage_db.export_to_xml(filename=os.path.join(output_path, "coverage.xml"))
